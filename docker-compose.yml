@@ -1,0 +1,358 @@
+name: blog-cms
+
+services:
+  # Database: deliberately amd64 as required by the assignment.
+  mysql:
+    image: mysql:8.4.11
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-wordpress}
+      MYSQL_USER: ${WORDPRESS_DB_USER:-wordpress}
+      MYSQL_PASSWORD: ${WORDPRESS_DB_PASSWORD:?Set WORDPRESS_DB_PASSWORD in .env}
+      MYSQL_EXPORTER_PASSWORD: ${MYSQL_EXPORTER_PASSWORD:?Set MYSQL_EXPORTER_PASSWORD in .env}
+    entrypoint: ["/bin/sh", "/opt/start-mysql.sh"]
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - mysql_logs:/var/log/mysql
+      - ./mysql/start-mysql.sh:/opt/start-mysql.sh:ro
+      - ./mysql/init/01-create-exporter-user.sh:/docker-entrypoint-initdb.d/01-create-exporter-user.sh:ro
+    networks:
+      - backend
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'mysqladmin ping -h 127.0.0.1 -uroot -p"$${MYSQL_ROOT_PASSWORD}" --silent',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 45s
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 300
+    security_opt:
+      - no-new-privileges:true
+
+  # WordPress sits on both networks: frontend for Nginx, backend for MySQL.
+  wordpress:
+    image: wordpress:7.1.3-php8.3-apache
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: mysql:3306
+      WORDPRESS_DB_NAME: ${MYSQL_DATABASE:-wordpress}
+      WORDPRESS_DB_USER: ${WORDPRESS_DB_USER:-wordpress}
+      WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD:?Set WORDPRESS_DB_PASSWORD in .env}
+      WORDPRESS_CONFIG_EXTRA: |
+        if (isset($$_SERVER['HTTP_X_FORWARDED_PROTO']) && strpos($$_SERVER['HTTP_X_FORWARDED_PROTO'], 'https') !== false) {
+          $$_SERVER['HTTPS'] = 'on';
+        }
+        define('WP_HOME', 'https://localhost:8443');
+        define('WP_SITEURL', 'https://localhost:8443');
+        define('FORCE_SSL_ADMIN', true);
+                if (!defined('DISALLOW_FILE_EDIT')) {
+          define('DISALLOW_FILE_EDIT', true);
+        }
+        if (!defined('WP_DEBUG_LOG')) {
+          define('WP_DEBUG_LOG', '/var/log/wordpress/debug.log');
+        }
+        if (!defined('WP_DEBUG_DISPLAY')) {
+          define('WP_DEBUG_DISPLAY', false);
+        }
+    volumes:
+      - wordpress_data:/var/www/html
+      - wordpress_logs:/var/log/wordpress
+      - ./wordpress/start-wordpress.sh:/opt/start-wordpress.sh:ro
+      - ./wordpress/themes/blog-cms-theme:/opt/blog-cms-theme:ro
+      - ./wordpress/mu-plugins/blog-cms-auto-theme.php:/opt/blog-cms-auto-theme.php:ro
+    networks:
+      - frontend
+      - backend
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'php -r ''$$s=@fsockopen("127.0.0.1",80); exit($$s?0:1);''',
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 200
+    security_opt:
+      - no-new-privileges:true
+
+  # phpMyAdmin is published only on host loopback, never on the LAN.
+  phpmyadmin:
+    image: phpmyadmin:5.2.3-apache
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_ARBITRARY: "0"
+      UPLOAD_LIMIT: 32M
+    ports:
+      - "127.0.0.1:8082:80"
+    networks:
+      - backend
+      - frontend
+      - access
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 150
+    security_opt:
+      - no-new-privileges:true
+
+  # Non-root Nginx reverse proxy: HTTP 8080 -> HTTPS 8443.
+  nginx:
+    image: nginxinc/nginx-unprivileged:1.28-alpine
+    restart: unless-stopped
+    depends_on:
+      wordpress:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - nginx_logs:/var/log/nginx
+    networks:
+      - frontend
+      - access
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /var/cache/nginx:size=32m,mode=1777
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-check-certificate -q -O /dev/null https://127.0.0.1:8443/healthz || exit 1",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 100
+    security_opt:
+      - no-new-privileges:true
+
+  # Exposes Nginx stub_status as Prometheus metrics.
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.4.2
+    restart: unless-stopped
+    command:
+      - --nginx.scrape-uri=http://nginx:8081/nginx_status
+    networks:
+      - frontend
+      - monitoring
+    depends_on:
+      nginx:
+        condition: service_healthy
+    mem_limit: 96m
+    cpus: 0.25
+    security_opt:
+      - no-new-privileges:true
+
+  # Tests HTTP(S) availability; Prometheus uses /probe for the WordPress URL.
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.28.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/blackbox_exporter/blackbox.yml
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox_exporter/blackbox.yml:ro
+    networks:
+      - frontend
+      - monitoring
+    mem_limit: 96m
+    cpus: 0.25
+    security_opt:
+      - no-new-privileges:true
+
+  # Uses a dedicated read-only-ish metrics account; no MySQL host port is published.
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.20.0
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: ${MYSQL_EXPORTER_PASSWORD:?Set MYSQL_EXPORTER_PASSWORD in .env}
+    command:
+      - --mysqld.address=mysql:3306
+      - --mysqld.username=exporter
+    networks:
+      - backend
+      - monitoring
+    mem_limit: 128m
+    cpus: 0.25
+    security_opt:
+      - no-new-privileges:true
+
+  # Container CPU/memory/network metrics via Docker Engine stats API, avoiding Linux host-path mounts
+  # that are fragile on Docker Desktop for Mac. The read-only Docker socket remains sensitive access.
+  docker-exporter:
+    image: ghcr.io/dlepaux/docker-exporter:latest
+    user: "0:0"
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - monitoring
+    mem_limit: 96m
+    cpus: 0.25
+    pids_limit: 100
+    security_opt:
+      - no-new-privileges:true
+
+  # Metrics collector; published only on localhost for the student demo.
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    restart: unless-stopped
+    depends_on:
+      - docker-exporter
+      - nginx-exporter
+      - mysqld-exporter
+      - blackbox-exporter
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - monitoring
+      - logging
+      - access
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: 512m
+    cpus: 0.75
+    pids_limit: 200
+    security_opt:
+      - no-new-privileges:true
+
+  # Grafana has pre-provisioned Prometheus and Loki data sources and a demo dashboard.
+  grafana:
+    image: grafana/grafana:12.4.11
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+      - loki
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_LOG_MODE: console
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - monitoring
+      - logging
+      - access
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    mem_limit: 512m
+    cpus: 0.75
+    pids_limit: 200
+    security_opt:
+      - no-new-privileges:true
+
+  # Single-node filesystem-backed Loki for the coursework/lab only.
+  loki:
+    image: grafana/loki:3.7.8
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    networks:
+      - logging
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 200
+    security_opt:
+      - no-new-privileges:true
+
+  # Tails logs from shared named volumes: compatible with Docker Desktop for Mac, no Docker socket needed.
+  promtail:
+    image: grafana/promtail:3.6.11
+    restart: unless-stopped
+    command:
+      - -config.file=/etc/promtail/promtail-config.yml
+      - -config.expand-env=true
+    volumes:
+      - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - nginx_logs:/var/log/nginx:ro
+      - mysql_logs:/var/log/mysql:ro
+      - wordpress_logs:/var/log/wordpress:ro
+      - promtail_positions:/tmp/positions
+    networks:
+      - logging
+    depends_on:
+      - loki
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 100
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  # Host-access network for services published on localhost.
+  access:
+  # User-facing traffic. No database is exposed here.
+  frontend:
+    internal: true
+  # Private application/database plane. No host port for MySQL.
+  backend:
+    internal: true
+  # Metrics plane, shared only with exporters and metrics consumers.
+  monitoring:
+    internal: true
+  # Log shipping and querying plane. Grafana/Prometheus join only to query it.
+  logging:
+    internal: true
+
+volumes:
+  mysql_data:
+  mysql_logs:
+  wordpress_data:
+  wordpress_logs:
+  nginx_logs:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  promtail_positions:

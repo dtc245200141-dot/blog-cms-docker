@@ -1,0 +1,29 @@
+.env
+.DS_Store
+nginx/certs/*.key
+nginx/certs/*.crt
+*.log
+
+# Local environment and secrets
+.env.*
+!.env.example
+
+# TLS private keys and certificates
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+
+# Logs, backups, and local runtime data
+logs/
+backups/
+*.sql
+*.sql.gz
+.DS_Store
+
+# Never commit TLS private keys, backups, or local certificate material
+nginx/certs/*.key.bak
+nginx/certs/*.crt.bak
+nginx/certs/*.pem.bak
+nginx/certs/*.cnf

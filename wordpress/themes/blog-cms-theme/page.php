@@ -1,0 +1,3 @@
+<?php get_header(); ?>
+<section class="article-page"><div class="container article-container"><?php while (have_posts()) : the_post(); ?><header class="article-header"><p class="eyebrow">TRANG / <?php echo esc_html(get_the_date('d/m/Y')); ?></p><h1><?php the_title(); ?></h1><?php if (has_excerpt()) : ?><p class="article-lead"><?php echo esc_html(get_the_excerpt()); ?></p><?php endif; ?></header><?php if (has_post_thumbnail()) : ?><div class="article-featured-image"><?php the_post_thumbnail('full'); ?></div><?php endif; ?><div class="entry-content"><?php the_content(); wp_link_pages(); ?></div><?php endwhile; ?></div></section>
+<?php get_footer(); ?>
